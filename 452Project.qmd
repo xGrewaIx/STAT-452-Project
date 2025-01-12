@@ -1,0 +1,527 @@
+---
+title: "452Project"
+author: "Dilpreet Grewal"
+format: pdf
+editor: visual
+---
+
+# Load in libraries
+
+```{r}
+library(tidyverse)
+library(nnet)
+library(glmnet)
+library(FNN)
+library(MASS)
+library(tidyverse)
+library(ranger)
+library(xgboost)
+library(gbm)
+library(randomForest)
+```
+
+# Load in test and training data and set seed
+
+```{r}
+set.seed(141252351)
+data <- read.csv("training_data.csv")
+test_data <- read.csv("test_predictors.csv")
+
+# from tutorial 3
+n <- nrow(data)
+new_order <- sample.int(n)
+size_train <- floor(n * 0.75)
+ind_train <- new_order[1:size_train]
+ind_valid <- new_order[(size_train + 1):n]
+
+data_train <- data[ind_train, ]
+data_valid <- data[ind_valid, ]
+
+# Check for normality within the variables
+results <- list()  # To store results
+
+# Loop over each predictor
+for (i in 1:40) {
+  # Construct column name
+  column_name <- paste("X", i, sep="")
+  # Perform the Shapiro-Wilk test on the column
+  test_result <- shapiro.test(data_train[[column_name]])
+  # Store the result with the column name
+  results[[column_name]] <- test_result$p.value
+}
+
+# View results, p value less than 0.05 means data not 
+# normally distributed
+# results
+
+
+# Create function get_MSPE right now
+# If needed later
+get_MSPE <- function(Y, Y_hat){
+  residuals <- Y - Y_hat
+  resid_sq <- residuals^2
+  SSPE <- sum(resid_sq)
+  MPSE <- SSPE / length(Y)
+  return(MSPE)
+}
+```
+
+# Explore data
+
+```{r}
+head(data)
+# Y seems to be one of two values, "1" or "2"
+# So Y (response) is binary or we can say categorical!!! 
+# X1 to X40 the values range for each column so scaling would be 
+# good for data
+
+# Edit data for the Y to be categorical 
+class(data_train$Y)
+data_train$Y <- as.factor(data_train$Y)
+class(data_train$Y)
+data_valid$Y <- as.factor(data_valid$Y)
+class(data_valid$Y)
+```
+
+# Sec11: K nearest neighbors
+```{r}
+# From section 11 and tutorial 8
+
+############
+## Need to scale all variables to have same SD
+#   so that "distance" is not dominated by different scalings
+
+# Function to Scaling x1 using mean and SD from set2
+############
+rescale <- function(x1, x2) {
+  for (col in 1:ncol(x1)) {
+    a <- min(x2[, col])
+    b <- max(x2[, col])
+    x1[, col] <- (x1[, col] - a) / (b - a)
+  }
+  x1
+}
+
+# Need to seperate Y from rest of data to scale
+set1.rescale_knn <- data.frame(cbind(rescale(data_train[, -1], data_train[, -1]), 
+                                 Y = data_train$Y))
+set2.rescale_knn <- data.frame(cbind(rescale(data_valid[, -1], data_valid[, -1]), 
+                                 Y = data_valid$Y))
+
+# split up predictor variables from class labels
+X.train.raw.knn <- set1.rescale_knn[,-41]
+X.valid.raw.knn <- set2.rescale_knn[,-41]
+Y.train.knn <- set1.rescale_knn[,41]
+Y.valid.knn <- set2.rescale_knn[,41]
+
+
+K_max <- 10 # Max number of neighbours 
+
+# Container to store CV misclassification rates
+mis_CV <- rep(0, times = K_max)
+for (i in 1:K_max) {
+  
+  this_knn <- knn.cv(X.train.raw.knn, Y.train.knn, k = i)
+  
+  # get and store CV misclassification rate
+  this_mis_CV <- mean(this_knn != Y.train.knn)
+  mis_CV[i] <- this_mis_CV
+}
+
+
+SE.mis_CV <- sapply(mis_CV, function(r) {
+  sqrt(r * (1 - r) / nrow(X.train.raw.knn))
+})
+
+
+### Get CV min value for K
+k.min <- which.min(mis_CV)
+thresh <- mis_CV[k.min] + SE.mis_CV[k.min]
+
+
+k.1se <- max(which(mis_CV <= thresh))
+### Finally, let's see how our tuned KNN models do
+knn.min <- knn(X.train.raw.knn, X.valid.raw.knn, Y.train.knn, k.min)
+knn.1se <- knn(X.train.raw.knn, X.valid.raw.knn, Y.train.knn, k.1se)
+
+table(knn.min, Y.valid.knn, dnn = c("Predicted", "Observed"))
+table(knn.1se, Y.valid.knn, dnn = c("Predicted", "Observed"))
+
+
+(mis.min <- mean(Y.valid.knn != knn.min))
+(mis.1se <- mean(Y.valid.knn != knn.1se))
+```
+error of 0.0504 on knn.min
+
+# Sec12: Logistic Regression with multinom
+
+```{r}
+# From section 12
+rescale <- function(x1, x2) {
+  for (col in 1:ncol(x1)) {
+    a <- min(x2[, col])
+    b <- max(x2[, col])
+    x1[, col] <- (x1[, col] - a) / (b - a)
+  }
+  x1
+}
+
+# Need to seperate Y from rest of data to scale
+set1.rescale <- data.frame(cbind(rescale(data_train[, -1], data_train[, -1]), 
+                                 Y = data_train$Y))
+set2.rescale <- data.frame(cbind(rescale(data_valid[, -1], data_valid[, -1]), 
+                                 Y = data_valid$Y))
+
+mod.fit <- multinom(
+  data = set1.rescale, formula = Y ~ .,
+  trace = TRUE
+)
+
+pred.class.1 <- predict(mod.fit,
+  newdata = set1.rescale,
+  type = "class"
+)
+pred.class.2 <- predict(mod.fit,
+  newdata = set2.rescale,
+  type = "class"
+)
+
+(mul.misclass.train <- mean(ifelse(pred.class.1 == data_train$Y,
+  yes = 0, no = 1
+)))
+(mul.misclass.test <- mean(ifelse(pred.class.2 == data_valid$Y,
+  yes = 0, no = 1
+)))
+
+
+# Estimated probabilities for test set
+pred.probs.2 <- predict(mod.fit,
+  newdata = set2.rescale,
+  type = "probs"
+)
+# round(head(pred.probs.2), 3)
+
+# Test set confusion matrix
+table(data_valid$Y, pred.class.2, dnn = c("Obs", "Pred"))
+```
+Error of 0.1112
+
+# Sec12: Multinomial Logistic Regression using glmnet()
+
+```{r}
+logit.fit <- glmnet(
+  x = as.matrix(set1.rescale[, -41]),
+  y = set1.rescale[, 41], family = "multinomial"
+)
+
+# Note that parameters are not the same as in multinom()
+coef(logit.fit, s = 0)
+
+# Predicted probabilities
+logit.prob.2 <- predict(logit.fit,
+  s = 0, type = "response",
+  newx = as.matrix(set2.rescale[, 1:40])
+)
+# round(head(logit.prob.2[, , 1]), 3)
+
+# Calculate in-sample and out-of-sample misclassification error
+las0.pred.train <- predict(
+  object = logit.fit, s = 0, type = "class",
+  newx = as.matrix(set1.rescale[, 1:40])
+)
+las0.pred.test <- predict(logit.fit,
+  s = 0, type = "class",
+  newx = as.matrix(set2.rescale[, 1:40])
+)
+(las0misclass.train <-
+  mean(ifelse(las0.pred.train == set1.rescale$Y,
+    yes = 0, no = 1
+  )))
+(las0misclass.test <-
+  mean(ifelse(las0.pred.test == set2.rescale$Y,
+    yes = 0, no = 1
+  )))
+
+
+# "Optimal" LASSO Fit
+logit.cv <- cv.glmnet(
+  x = as.matrix(set1.rescale[, 1:40]),
+  y = set1.rescale[, 41], family = "multinomial"
+)
+# logit.cv
+
+# plot(logit.cv)
+
+## Find nonzero lasso coefficients
+c <- coef(logit.fit, s = logit.cv$lambda.min)
+cmat <- cbind(
+  as.matrix(c[[1]]), as.matrix(c[[2]])
+)
+round(cmat, 2)
+cmat != 0
+
+lascv.pred.train <- predict(
+  object = logit.cv, type = "class",
+  s = logit.cv$lambda.min,
+  newx = as.matrix(set1.rescale[, 1:40])
+)
+lascv.pred.test <- predict(logit.cv,
+  type = "class",
+  s = logit.cv$lambda.min,
+  newx = as.matrix(set2.rescale[, 1:40])
+)
+(lascvmisclass.train <-
+  mean(ifelse(lascv.pred.train == data_train$Y, yes = 0, no = 1)))
+(lascvmisclass.test <-
+  mean(ifelse(lascv.pred.test == data_valid$Y, yes = 0, no = 1)))
+```
+error of 0.1168
+
+# Sec12: Discriminant Analysis Wheat
+```{r}
+# lda first 
+### To interpret class means and discrim coefs better,
+###  rescale data to 0 mean, 1 SD first. Then all
+###  differences in means are comparable for all vars.
+
+set1s <- apply(data_train[, -1], 2, scale)
+set1s <- data.frame(set1s, Y = data_train$Y)
+lda.fit.s <- lda(data = set1s, Y ~ .)
+# lda.fit.s
+
+# Fit gives identical results as without scaling, but
+#  can't interpret means
+lda.fit <- lda(x = data_train[, -1], grouping = data_train$Y)
+# lda.fit
+
+# Calculate in-sample and out-of-sample misclassification error
+lda.pred.train <- predict(lda.fit, newdata = data_train[, -1])$class
+lda.pred.test <- predict(lda.fit, newdata = data_valid[, -1])$class
+(lmisclass.train <- mean(ifelse(lda.pred.train == data_train$Y, yes = 0, no = 1)))
+(lmisclass.test <- mean(ifelse(lda.pred.test == data_valid$Y, yes = 0, no = 1)))
+
+# Test set confusion matrix
+table(data_valid$Y, lda.pred.test, dnn = c("Obs", "Pred"))
+
+# Calculate in-sample and out-of-sample misclassification error
+lda.pred.train.s <- predict(lda.fit.s, newdata = data_train[, -1])$class
+lda.pred.test.s <- predict(lda.fit.s, newdata = data_valid[, -1])$class
+(lmisclass.train.s <- mean(ifelse(lda.pred.train.s == data_train$Y, yes = 0, no = 1)))
+(lmisclass.test.s <- mean(ifelse(lda.pred.test.s == data_valid$Y, yes = 0, no = 1)))
+
+# Test set confusion matrix
+table(data_valid$Y, lda.pred.test.s, dnn = c("Obs", "Pred"))
+
+```
+error of 0.0448 on unscaled data
+
+# Sec17: Random Forest
+```{r}
+# Random forest section 17
+reps <- 5
+varz <- 1:6
+nodez <- c(1, 3, 5, 7, 10)
+
+NS <- length(nodez)
+M <- length(varz)
+rf.oob <- matrix(NA, nrow = M * NS, ncol = reps)
+
+for (r in 1:reps) {
+  counter <- 1
+  for (m in varz) {
+    for (ns in nodez) {
+      project.rfm <- randomForest(
+        data = data_train, Y ~ .,
+        mtry = m, nodesize = ns
+      )
+      rf.oob[counter, r] <- mean(predict(project.rfm, type = "response") != data_train$Y)
+      counter <- counter + 1
+    }
+  }
+}
+
+parms <- expand.grid(nodez, varz)
+row.names(rf.oob) <- paste(parms[, 2], parms[, 1], sep = "|")
+
+mean.oob <- apply(rf.oob, 1, mean)
+#mean.oob[order(mean.oob)]
+
+min.oob <- apply(rf.oob, 2, min)
+
+# x11(h=7,w=10,pointsize=8)
+boxplot(rf.oob, use.cols = FALSE, las = 2)
+
+# x11(h=7,w=10,pointsize=8)
+boxplot(t(rf.oob) / min.oob,
+  use.cols = TRUE, las = 2,
+  main = "RF Tuning Variables and Node Sizes"
+)
+# Suggested parameters are mtry=6, nodesize=5 or 6,3 
+# 6,3 gives better predictions
+
+pro.rf.tun <- randomForest(
+  data = data_train, Y ~ ., mtry = 6, nodesize = 3,
+  importance = TRUE, keep.forest = TRUE
+)
+
+# Predict results of classification.
+pred.rf.train.tun <- predict(pro.rf.tun, newdata = data_train, type = "response")
+pred.rf.test.tun <- predict(pro.rf.tun, newdata = data_valid, type = "response")
+# "vote" gives proportions of trees voting for each class
+pred.rf.vtrain.tun <- predict(pro.rf.tun, newdata = data_train, type = "vote")
+pred.rf.vtest.tun <- predict(pro.rf.tun, newdata = data_valid, type = "vote")
+# head(cbind(pred.rf.test.tun, pred.rf.vtest.tun))
+
+(misclass.train.rf.tun <- mean(ifelse(pred.rf.train.tun == data_train$Y, yes = 0, no = 1)))
+(misclass.test.rf.tun <- mean(ifelse(pred.rf.test.tun == data_valid$Y, yes = 0, no = 1)))
+
+table(data_valid$Y, pred.rf.test.tun, dnn = c("Obs", "Pred"))
+```
+error of 0.0272
+
+# Tutorial 11: Use ranger
+```{r}
+# set tuning parameters
+# warning takes long time to run
+all_mtrys <- 1:6
+all_nodesizes <- c(1, 5, 10, 15, 20)
+all_pars_rf <- expand.grid(mtry = all_mtrys, nodesize = all_nodesizes)
+n_pars <- nrow(all_pars_rf)
+
+M <- 5 # Number of times to repeat RF fitting. I.e. Number of OOB errors
+
+all_OOB_rf <- array(0, dim = c(M, n_pars))
+names_pars <- apply(all_pars_rf, 1, paste0, collapse = "-")
+colnames(all_OOB_rf) <- names_pars
+
+
+for (i in 1:n_pars) {
+  
+  this_mtry <- all_pars_rf[i, "mtry"]
+  this_nodesize <- all_pars_rf[i, "nodesize"]
+  
+  for (j in 1:M) {
+    this_fit_rf <- ranger(Y ~ .,
+                          data = data_train,
+                          mtry = this_mtry, min.node.size = this_nodesize
+                          )
+    pred_this_rf <- this_fit_rf$predictions
+    this_err_rf <- mean(data_train$Y != pred_this_rf)
+    
+    all_OOB_rf[j, i] <- this_err_rf
+  }
+}
+
+boxplot(all_OOB_rf, las = 2, main = "OOB Boxplot")
+
+rel_OOB_rf <- apply(all_OOB_rf, 1, function(W) W / min(W))
+boxplot(t(rel_OOB_rf),
+  las = 2, # las sets the axis label orientation
+  main = "Relative OOB Boxplot"
+)
+
+# best model has mtry=6 and min.node.size=1
+tuned_rf <- ranger(Y ~ ., data = data_train, mtry = 6,
+  min.node.size = 1, num.trees = 1000)
+
+pred_rf_tuned <- predict(tuned_rf, data = data_valid)
+
+test_error <- mean(pred_rf_tuned$predictions != data_valid$Y)
+test_error
+```
+error of 0.0264
+
+# Tutorial 11: Use xgboost
+ANSWER WHY IN REPORT USING CITATIONS
+https://www.geeksforgeeks.org/gradientboosting-vs-adaboost-vs-xgboost-vs-catboost-vs-lightgbm/
+https://datascience.stackexchange.com/questions/16904/gbm-vs-xgboost-key-differences
+https://xgboost.readthedocs.io/en/stable/parameter.html
+```{r}
+# xgboost was used in tutoral 11
+# Takes long time to run
+eta_vals <- c(0.0001, 0.001, 0.01, 0.1, 0.25, 0.5)
+depth_vals <- c(1:8)
+
+data_matrix <- xgb.DMatrix(
+  data = as.matrix(data_train[, -1]),
+  label = data_train$Y
+)
+
+all_pars_boost <- expand.grid(eta = eta_vals, depth = depth_vals)
+n_pars <- nrow(all_pars_boost)
+
+M <- 5
+
+all_OOB_boost <- array(0, dim = c(M, n_pars))
+names_pars <- apply(all_pars_boost, 1, paste0, collapse = "-")
+colnames(all_OOB_boost) <- names_pars
+
+params <- list(
+  objective = "multi:softmax",
+  num_class = 2
+)
+
+for (i in 1:n_pars) {
+  ### Progress update
+  # print(paste0(i, " of ", n_pars))
+  
+  this_eta <- all_pars_boost[i, "eta"]
+  this_depth <- all_pars_boost[i, "depth"]
+  
+  cv_results <- xgb.cv(data = as.matrix(data_train[, -1]),
+                       label = as.numeric(data_train$Y) - 1,
+                       params = params,
+                       nfold = M,
+                       nrounds = 100,
+                       verbose = 0,
+                       eta = this_eta,
+                       depth = this_depth,
+                       prediction = TRUE
+                      )
+  for (j in 1:M) {
+    
+    fold_index <- cv_results$folds[[j]]
+    fold_pred <- cv_results$pred[fold_index, 1]
+    mc_error <- mean( (as.numeric(data_train$Y[fold_index]) - 1) != fold_pred)
+    all_OOB_boost[j, i] <- mc_error
+  }
+}
+
+boxplot(all_OOB_boost, las = 2, main = "OOB Boxplot")
+
+rel_OOB_boost <- apply(all_OOB_boost, 1, function(W) W / min(W))
+boxplot(t(rel_OOB_boost),
+  las = 2, # las sets the axis label orientation
+  main = "Relative OOB Boxplot"
+)
+
+# choose 0.25 as eta and depth of 3
+boost_model_tuned <- xgboost(data = as.matrix(data_train[, -1]),
+                             label = as.numeric(data_train$Y) - 1,
+                             params = params,
+                             nrounds = 100,
+                             verbose = 0,
+                             eta = 0.25,
+                             max_depth = 3,
+                            )
+
+pred_boost_tuned <- predict(boost_model_tuned, newdata = as.matrix(data_valid[, -1]))
+boost_test_error <- mean(pred_boost_tuned != as.numeric(data_valid$Y) - 1)
+boost_test_error
+```
+error of 0.0176
+
+# Write csv of predictions 
+```{r}
+# Create csv of predictions
+# best model was the xgboost model as it had the lowest error
+
+predictions <- predict(boost_model_tuned, newdata = as.matrix(test_data))
+
+write.table(predictions,
+            "301451516.csv",
+            sep = ".",
+            row.names = FALSE,
+            col.names = FALSE)
+
+```
